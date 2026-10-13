@@ -283,7 +283,7 @@ static const COMMAND_LINE_ARGUMENT_A global_cmd_args[] = {
 	  " * layout: set the keybouard layout announced to the server\n"
 	  " * lang: set the keyboard language identifier sent to the server\n"
 	  " * fn-key: Function key value\n"
-	  " * defer-alt: [X11] Defer left Alt until guest input; discard unused Alt on host focus/grab "
+	  " * defer-alt: [X11] Defer Alt (except AltGr) until guest input; discard unused Alt on host focus/grab "
 	  "changes (default: off)\n"
 	  " * remap: RDP scancode to another one. Use /list:kbd-scancode to get the mapping. Example: "
 	  "To switch "

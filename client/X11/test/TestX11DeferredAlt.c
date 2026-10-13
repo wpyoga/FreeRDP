@@ -12,6 +12,7 @@
 static char trace[1024];
 static size_t used;
 static BOOL failAlt;
+static BOOL altGr;
 static char physical[32];
 static const struct
 {
@@ -41,6 +42,8 @@ static void record(char name, char direction)
 KeyCode XKeysymToKeycode(Display* display, KeySym sym)
 {
 	WINPR_UNUSED(display);
+	if (sym == XK_ISO_Level3_Shift || sym == XK_Mode_switch)
+		return altGr ? 108 : 0;
 	for (size_t i = 0; i < ARRAYSIZE(keys); i++)
 	{
 		if (keys[i].sym == sym)
@@ -84,7 +87,7 @@ int XUngrabKeyboard(Display* display, Time time)
 BOOL freerdp_input_send_keyboard_event_ex(rdpInput* input, BOOL down, BOOL repeat, UINT32 scan)
 {
 	WINPR_UNUSED(input);
-	if (failAlt && down && (scan == RDP_SCANCODE_LMENU))
+	if (failAlt && down && ((scan == RDP_SCANCODE_LMENU) || (scan == RDP_SCANCODE_RMENU)))
 		return FALSE;
 	for (size_t i = 0; i < ARRAYSIZE(keys); i++)
 	{
@@ -201,7 +204,8 @@ enum
 {
 	DEFAULT_MODE = 1,
 	UNICODE_MODE = 2,
-	FAIL_ALT = 4
+	FAIL_ALT = 4,
+	ALTGR_MODE = 8
 };
 static const struct
 {
@@ -226,7 +230,38 @@ static const struct
 	{ "modifier flush has no duplicate Ctrl",
 	  { ALT_DOWN, CTRL_DOWN, CTRL_UP, ALT_UP },
 	  "A+C+C-A-" },
-	{ "right Alt immediate", { RIGHT_ALT_DOWN }, "R+" },
+	{ "right Alt default immediate", { RIGHT_ALT_DOWN }, "R+", DEFAULT_MODE },
+	{ "right Alt pending", { RIGHT_ALT_DOWN, RIGHT_ALT_DOWN }, "" },
+	{ "failed right Alt-down never produces Alt-up",
+	  { RIGHT_ALT_DOWN, RIGHT_ALT_UP },
+	  "",
+	  FAIL_ALT },
+	{ "right Alt tap", { RIGHT_ALT_DOWN, RIGHT_ALT_UP }, "R+R-" },
+	{ "right Alt Unicode tap", { RIGHT_ALT_DOWN, RIGHT_ALT_UP }, "R+R-", UNICODE_MODE },
+	{ "AltGr immediate", { RIGHT_ALT_DOWN }, "R+", ALTGR_MODE },
+	{ "AltGr chord", { RIGHT_ALT_DOWN, F_DOWN, F_UP, RIGHT_ALT_UP }, "R+F+F-R-", ALTGR_MODE },
+	{ "right Alt host grab", { RIGHT_ALT_DOWN, GRAB_OUT, RIGHT_ALT_UP, GRAB_IN }, "" },
+	{ "right Alt+Shift host switching",
+	  { RIGHT_ALT_DOWN, SHIFT_DOWN, GRAB_OUT, SHIFT_UP, RIGHT_ALT_UP, GRAB_IN },
+	  "" },
+	{ "right Alt held on return",
+	  { RIGHT_ALT_DOWN, FOCUS_OUT, FOCUS_IN, RIGHT_ALT_DOWN, RIGHT_ALT_UP },
+	  "" },
+	{ "right Alt held on return then chord",
+	  { RIGHT_ALT_DOWN, GRAB_OUT, GRAB_IN, F_DOWN, F_UP, RIGHT_ALT_UP },
+	  "R+F+F-R-" },
+	{ "right Alt+button", { RIGHT_ALT_DOWN, BUTTON_DOWN, BUTTON_UP, RIGHT_ALT_UP }, "R+B+B-R-" },
+	{ "right Alt+wheel", { RIGHT_ALT_DOWN, WHEEL_DOWN, RIGHT_ALT_UP }, "R+W+R-" },
+	{ "both Alt keys, release first",
+	  { ALT_DOWN, RIGHT_ALT_DOWN, ALT_UP, RIGHT_ALT_UP },
+	  "A+R+A-R-" },
+	{ "both Alt keys, release second",
+	  { RIGHT_ALT_DOWN, ALT_DOWN, ALT_UP, RIGHT_ALT_UP },
+	  "R+A+A-R-" },
+	{ "AltGr held on return",
+	  { RIGHT_ALT_DOWN, FOCUS_OUT, FOCUS_IN, F_DOWN, F_UP, RIGHT_ALT_UP },
+	  "R+R-R+F+F-R-",
+	  ALTGR_MODE },
 	{ "right Alt chord", { RIGHT_ALT_DOWN, F_DOWN, F_UP, RIGHT_ALT_UP }, "R+F+F-R-" },
 	{ "host grab consumes Tab without focus switch", { ALT_DOWN, GRAB_OUT, ALT_UP, GRAB_IN }, "" },
 	{ "host Alt+Shift+Tab and unmatched Tab release",
@@ -337,6 +372,7 @@ int main(int argc, char* argv[])
 		used = 0;
 		trace[0] = '\0';
 		failAlt = (cases[i].flags & FAIL_ALT) != 0;
+		altGr = (cases[i].flags & ALTGR_MODE) != 0;
 		if (!freerdp_settings_set_bool(settings, FreeRDP_KeyboardDeferAlt,
 		                               !(cases[i].flags & DEFAULT_MODE)) ||
 		    !freerdp_settings_set_bool(settings, FreeRDP_UnicodeInput,

@@ -929,8 +929,8 @@ static void xf_keyboard_flush_deferred_alt_except(xfContext* xfc, KeyCode skip)
 	xf_keyboard_flush_pending_alt(xfc);
 	/* Restore physically held modifiers on the next guest action, never as a tap.
 	 * QueryKeymap on focus-in distinguishes left/right modifiers, unlike modifier masks. */
-	const KeySym modifiers[] = { XK_Shift_L, XK_Shift_R, XK_Control_L, XK_Control_R,
-	                             XK_Alt_R,   XK_Super_L, XK_Super_R };
+	const KeySym modifiers[] = { XK_Shift_L, XK_Shift_R, XK_Control_L, XK_Control_R, XK_Alt_R,
+	                            XK_ISO_Level3_Shift, XK_Mode_switch, XK_Super_L, XK_Super_R };
 	for (size_t i = 0; i < ARRAYSIZE(modifiers); i++)
 	{
 		const KeyCode code = XKeysymToKeycode(xfc->display, modifiers[i]);
@@ -944,16 +944,28 @@ void xf_keyboard_flush_deferred_alt(xfContext* xfc)
 	xf_keyboard_flush_deferred_alt_except(xfc, 0);
 }
 
+static BOOL xf_keyboard_is_deferred_alt(xfContext* xfc, KeyCode code)
+{
+	const DWORD scancode = get_rdp_scancode_from_x11_keycode(xfc, code);
+	if ((code == XKeysymToKeycode(xfc->display, XK_Alt_L)) && (scancode == RDP_SCANCODE_LMENU))
+		return TRUE;
+	/* AltGr can share a keycode with an Alt_R keysym at another level. */
+	return (code == XKeysymToKeycode(xfc->display, XK_Alt_R)) &&
+	       (scancode == RDP_SCANCODE_RMENU) &&
+	       (code != XKeysymToKeycode(xfc->display, XK_ISO_Level3_Shift)) &&
+	       (code != XKeysymToKeycode(xfc->display, XK_Mode_switch));
+}
+
 static BOOL xf_keyboard_deferred_key(xfContext* xfc, BOOL down, BOOL repeat, const XKeyEvent* event,
                                      KeySym keysym)
 {
-	/* Match the physical left Alt as well as its effective mapping. Right Alt/AltGr
-	 * and a left Alt explicitly remapped to another scancode retain their behavior. */
-	const BOOL alt = (event->keycode == XKeysymToKeycode(xfc->display, XK_Alt_L)) &&
-	                 (get_rdp_scancode_from_x11_keycode(xfc, event->keycode) == RDP_SCANCODE_LMENU);
+	const BOOL alt = xf_keyboard_is_deferred_alt(xfc, (KeyCode)event->keycode);
 	const BOOL shift = (keysym == XK_Shift_L) || (keysym == XK_Shift_R);
 	if (xfc->deferredAlt.blocked)
 		return TRUE;
+	/* A second Alt is guest input, not a repeat/release of the pending Alt. */
+	if (alt && (event->keycode != xfc->deferredAlt.alt) && (!down || xfc->deferredAlt.held))
+		return FALSE;
 	if (alt)
 	{
 		if (down)
@@ -1353,7 +1365,16 @@ static void xk_keyboard_update_modifier_keys(xfContext* xfc)
 	const int state = xf_keyboard_read_keyboard_state(xfc);
 	char physical[32] = { 0 };
 	if (xf_keyboard_defer_alt_enabled(xfc))
+	{
 		XQueryKeymap(xfc->display, physical);
+		const KeySym levelKeys[] = { XK_ISO_Level3_Shift, XK_Mode_switch };
+		for (size_t i = 0; i < ARRAYSIZE(levelKeys); i++)
+		{
+			const KeyCode code = XKeysymToKeycode(xfc->display, levelKeys[i]);
+			if (code)
+				xfc->KeyboardState[code] = (physical[code / 8] & (1 << (code % 8))) != 0;
+		}
+	}
 
 	for (size_t i = 0; i < ARRAYSIZE(keysyms); i++)
 	{
@@ -1390,10 +1411,11 @@ void xf_keyboard_focus_in(xfContext* xfc)
 	xk_keyboard_update_modifier_keys(xfc);
 	if (xf_keyboard_defer_alt_enabled(xfc))
 	{
-		const KeyCode alt = XKeysymToKeycode(xfc->display, XK_Alt_L);
+		KeyCode alt = XKeysymToKeycode(xfc->display, XK_Alt_L);
+		if (!alt || !xfc->KeyboardState[alt] || !xf_keyboard_is_deferred_alt(xfc, alt))
+			alt = XKeysymToKeycode(xfc->display, XK_Alt_R);
 		xfc->deferredAlt.alt = alt;
-		xfc->deferredAlt.held = alt && xfc->KeyboardState[alt] &&
-		                        (get_rdp_scancode_from_x11_keycode(xfc, alt) == RDP_SCANCODE_LMENU);
+		xfc->deferredAlt.held = alt && xfc->KeyboardState[alt] && xf_keyboard_is_deferred_alt(xfc, alt);
 		xfc->deferredAlt.blocked = FALSE;
 		xfc->deferredAlt.canceled = TRUE;
 		xfc->deferredAlt.count = 0;
