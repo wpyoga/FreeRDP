@@ -159,30 +159,145 @@ static BOOL focus(xfContext* xfc, int type, int mode)
 	return xf_event_process(xfc->common.context.instance, &event);
 }
 
-static BOOL expect(const char* label, const char* expected)
+typedef enum
 {
-	if (strcmp(trace, expected) == 0)
-		return TRUE;
-	fprintf(stderr, "%s: expected '%s', got '%s'\n", label, expected, trace);
-	return FALSE;
-}
+	END,
+	ALT_DOWN,
+	ALT_UP,
+	SHIFT_DOWN,
+	SHIFT_UP,
+	CTRL_DOWN,
+	CTRL_UP,
+	RIGHT_ALT_DOWN,
+	RIGHT_ALT_UP,
+	F_DOWN,
+	F_UP,
+	TAB_UP,
+	GRAB_OUT,
+	GRAB_IN,
+	FOCUS_OUT,
+	FOCUS_IN,
+	WHILE_GRABBED_OUT,
+	MOTION,
+	BUTTON_DOWN,
+	BUTTON_UP,
+	WHEEL_DOWN,
+	WHEEL_UP,
+	RAW_BUTTON_DOWN,
+	LOCAL_CANCEL
+} Event;
 
-#define CHECK(label, expected)        \
-	do                                \
-	{                                 \
-		if (!expect(label, expected)) \
-			goto out;                 \
-	} while (0)
-#define RESET()                                                          \
-	do                                                                   \
-	{                                                                    \
-		memset(xfc.KeyboardState, 0, sizeof(xfc.KeyboardState));         \
-		memset(xfc.KeyboardForwarded, 0, sizeof(xfc.KeyboardForwarded)); \
-		memset(&xfc.deferredAlt, 0, sizeof(xfc.deferredAlt));            \
-		memset(physical, 0, sizeof(physical));                           \
-		used = 0;                                                        \
-		trace[0] = '\0';                                                 \
-	} while (0)
+static const struct
+{
+	KeySym sym;
+	BOOL down;
+} keyEvents[] = {
+	{ 0, FALSE },          { XK_Alt_L, TRUE },     { XK_Alt_L, FALSE },     { XK_Shift_L, TRUE },
+	{ XK_Shift_L, FALSE }, { XK_Control_L, TRUE }, { XK_Control_L, FALSE }, { XK_Alt_R, TRUE },
+	{ XK_Alt_R, FALSE },   { XK_f, TRUE },         { XK_f, FALSE },         { XK_Tab, FALSE }
+};
+
+enum
+{
+	DEFAULT_MODE = 1,
+	UNICODE_MODE = 2,
+	FAIL_ALT = 4
+};
+static const struct
+{
+	const char* name;
+	Event events[16];
+	const char* expected;
+	unsigned flags;
+} cases[] = {
+	{ "default sends immediately", { ALT_DOWN }, "A+", DEFAULT_MODE },
+	{ "default Alt tap", { ALT_DOWN, ALT_UP }, "A+A-", DEFAULT_MODE },
+	{ "pending repeats", { ALT_DOWN, ALT_DOWN }, "" },
+	{ "bare tap", { ALT_DOWN, ALT_DOWN, ALT_UP }, "A+A-" },
+	{ "Unicode Alt tap uses scancodes", { ALT_DOWN, ALT_UP }, "A+A-", UNICODE_MODE },
+	{ "Alt+F ordering and repeat", { ALT_DOWN, F_DOWN, F_DOWN, F_UP, ALT_UP }, "A+F+F*F-A-" },
+	{ "Shift before Alt",
+	  { SHIFT_DOWN, ALT_DOWN, F_DOWN, F_UP, ALT_UP, SHIFT_UP },
+	  "S+A+F+F-A-S-" },
+	{ "Alt+Shift pending", { ALT_DOWN, SHIFT_DOWN, SHIFT_DOWN }, "" },
+	{ "Alt before Shift",
+	  { ALT_DOWN, SHIFT_DOWN, SHIFT_DOWN, F_DOWN, F_UP, SHIFT_UP, ALT_UP },
+	  "A+S+F+F-S-A-" },
+	{ "modifier flush has no duplicate Ctrl",
+	  { ALT_DOWN, CTRL_DOWN, CTRL_UP, ALT_UP },
+	  "A+C+C-A-" },
+	{ "right Alt immediate", { RIGHT_ALT_DOWN }, "R+" },
+	{ "right Alt chord", { RIGHT_ALT_DOWN, F_DOWN, F_UP, RIGHT_ALT_UP }, "R+F+F-R-" },
+	{ "host grab consumes Tab without focus switch", { ALT_DOWN, GRAB_OUT, ALT_UP, GRAB_IN }, "" },
+	{ "host Alt+Shift+Tab and unmatched Tab release",
+	  { ALT_DOWN, SHIFT_DOWN, GRAB_OUT, FOCUS_OUT, SHIFT_UP, ALT_UP, FOCUS_IN, TAB_UP },
+	  "" },
+	{ "return with Alt held, repeat then release",
+	  { ALT_DOWN, FOCUS_OUT, FOCUS_IN, ALT_DOWN, ALT_UP },
+	  "" },
+	{ "return held Alt then guest chord",
+	  { ALT_DOWN, GRAB_OUT, GRAB_IN, F_DOWN, F_UP, ALT_UP },
+	  "A+F+F-A-" },
+	{ "cleanup releases only forwarded keys in order",
+	  { ALT_DOWN, F_DOWN, WHILE_GRABBED_OUT },
+	  "A+F+F-A-" },
+	{ "cleanup does not repeat releases",
+	  { ALT_DOWN, F_DOWN, WHILE_GRABBED_OUT, F_UP, ALT_UP, FOCUS_IN },
+	  "A+F+F-A-" },
+	{ "pointer motion leaves Alt pending", { ALT_DOWN, MOTION }, "M-" },
+	{ "Alt+button", { ALT_DOWN, MOTION, BUTTON_DOWN, BUTTON_UP, ALT_UP }, "M-A+B+B-A-" },
+	{ "wheel release is not input", { ALT_DOWN, WHEEL_UP }, "" },
+	{ "Alt+wheel", { ALT_DOWN, WHEEL_UP, WHEEL_DOWN, ALT_UP }, "A+W+A-" },
+	{ "Alt+raw extended button", { ALT_DOWN, RAW_BUTTON_DOWN, ALT_UP }, "A+E+A-" },
+	{ "queued Shift tap preserves order", { ALT_DOWN, SHIFT_DOWN, SHIFT_UP, ALT_UP }, "A+S+S-A-" },
+	{ "resync never manufactures modifier taps", { ALT_DOWN, SHIFT_DOWN, GRAB_OUT, GRAB_IN }, "" },
+	{ "return with Alt and Shift physically held",
+	  { ALT_DOWN, SHIFT_DOWN, GRAB_OUT, GRAB_IN, F_DOWN, F_UP, SHIFT_UP, ALT_UP },
+	  "A+S+F+F-S-A-" },
+	{ "local action suppresses unused Alt tap", { ALT_DOWN, LOCAL_CANCEL, ALT_UP }, "" },
+	{ "local cancellation retains already forwarded Alt release",
+	  { ALT_DOWN, F_DOWN, F_UP, LOCAL_CANCEL, ALT_UP },
+	  "A+F+F-A-" },
+	{ "failed Alt-down never produces Alt-up", { ALT_DOWN, ALT_UP }, "", FAIL_ALT }
+};
+
+static BOOL dispatch(xfContext* xfc, Event event)
+{
+	if (event > END && event < ARRAYSIZE(keyEvents))
+	{
+		key(xfc, keyEvents[event].sym, keyEvents[event].down);
+		return TRUE;
+	}
+	switch (event)
+	{
+		case GRAB_OUT:
+			return focus(xfc, FocusOut, NotifyGrab);
+		case GRAB_IN:
+			return focus(xfc, FocusIn, NotifyUngrab);
+		case FOCUS_OUT:
+			return focus(xfc, FocusOut, NotifyNormal);
+		case FOCUS_IN:
+			return focus(xfc, FocusIn, NotifyNormal);
+		case WHILE_GRABBED_OUT:
+			return focus(xfc, FocusOut, NotifyWhileGrabbed);
+		case MOTION:
+			return xf_generic_MotionNotify(xfc, 10, 20, None, FALSE);
+		case BUTTON_DOWN:
+		case BUTTON_UP:
+			return xf_generic_ButtonEvent(xfc, 10, 20, 1, None, FALSE, event == BUTTON_DOWN);
+		case WHEEL_DOWN:
+		case WHEEL_UP:
+			return xf_generic_ButtonEvent(xfc, 10, 20, 4, None, FALSE, event == WHEEL_DOWN);
+		case RAW_BUTTON_DOWN:
+			return xf_generic_RawButtonEvent(xfc, 8, FALSE, TRUE);
+		case LOCAL_CANCEL:
+			xf_keyboard_discard_deferred_alt(xfc);
+			xfc->deferredAlt.blocked = FALSE; /* Local action without losing focus. */
+			return TRUE;
+		default:
+			return FALSE;
+	}
+}
 
 int main(int argc, char* argv[])
 {
@@ -197,8 +312,6 @@ int main(int argc, char* argv[])
 	rdpSettings* settings = freerdp_settings_new(0);
 	if (!settings)
 		return 1;
-	if (!freerdp_settings_set_bool(settings, FreeRDP_UnicodeInput, FALSE))
-		goto out;
 	xfc.common.context.settings = settings;
 	xfc.common.context.input = &input;
 	xfc.common.context.instance = &instance;
@@ -215,180 +328,35 @@ int main(int argc, char* argv[])
 	xfc.button_map[1].flags = PTR_FLAGS_WHEEL | 120;
 	xfc.button_map[2].button = 8;
 	xfc.button_map[2].flags = PTR_XFLAGS_BUTTON1;
-	key(&xfc, XK_Alt_L, TRUE);
-	CHECK("default sends immediately", "A+");
-	key(&xfc, XK_Alt_L, FALSE);
-	CHECK("default Alt tap", "A+A-");
-	if (!freerdp_settings_set_bool(settings, FreeRDP_KeyboardDeferAlt, TRUE))
-		goto out;
-	RESET();
-	key(&xfc, XK_Alt_L, TRUE);
-	key(&xfc, XK_Alt_L, TRUE);
-	CHECK("pending repeats", "");
-	key(&xfc, XK_Alt_L, FALSE);
-	CHECK("bare tap", "A+A-");
-	RESET();
-	if (!freerdp_settings_set_bool(settings, FreeRDP_UnicodeInput, TRUE))
-		goto out;
-	key(&xfc, XK_Alt_L, TRUE);
-	key(&xfc, XK_Alt_L, FALSE);
-	CHECK("Unicode Alt tap uses scancodes", "A+A-");
-	if (!freerdp_settings_set_bool(settings, FreeRDP_UnicodeInput, FALSE))
-		goto out;
-	RESET();
-	key(&xfc, XK_Alt_L, TRUE);
-	key(&xfc, XK_f, TRUE);
-	key(&xfc, XK_f, TRUE);
-	key(&xfc, XK_f, FALSE);
-	key(&xfc, XK_Alt_L, FALSE);
-	CHECK("Alt+F ordering and repeat", "A+F+F*F-A-");
-	RESET();
-	key(&xfc, XK_Shift_L, TRUE);
-	key(&xfc, XK_Alt_L, TRUE);
-	key(&xfc, XK_f, TRUE);
-	key(&xfc, XK_f, FALSE);
-	key(&xfc, XK_Alt_L, FALSE);
-	key(&xfc, XK_Shift_L, FALSE);
-	CHECK("Shift before Alt", "S+A+F+F-A-S-");
-	RESET();
-	key(&xfc, XK_Alt_L, TRUE);
-	key(&xfc, XK_Shift_L, TRUE);
-	key(&xfc, XK_Shift_L, TRUE);
-	CHECK("Alt+Shift pending", "");
-	key(&xfc, XK_f, TRUE);
-	key(&xfc, XK_f, FALSE);
-	key(&xfc, XK_Shift_L, FALSE);
-	key(&xfc, XK_Alt_L, FALSE);
-	CHECK("Alt before Shift", "A+S+F+F-S-A-");
-	RESET();
-	key(&xfc, XK_Alt_L, TRUE);
-	key(&xfc, XK_Control_L, TRUE);
-	key(&xfc, XK_Control_L, FALSE);
-	key(&xfc, XK_Alt_L, FALSE);
-	CHECK("modifier flush has no duplicate Ctrl", "A+C+C-A-");
-	RESET();
-	key(&xfc, XK_Alt_R, TRUE);
-	CHECK("right Alt immediate", "R+");
-	key(&xfc, XK_f, TRUE);
-	key(&xfc, XK_f, FALSE);
-	key(&xfc, XK_Alt_R, FALSE);
-	CHECK("right Alt chord", "R+F+F-R-");
-	RESET();
-	key(&xfc, XK_Alt_L, TRUE);
-	if (!focus(&xfc, FocusOut, NotifyGrab))
-		goto out;
-	key(&xfc, XK_Alt_L, FALSE);
-	if (!focus(&xfc, FocusIn, NotifyUngrab))
-		goto out;
-	CHECK("host grab consumes Tab without focus switch", "");
-	RESET();
-	key(&xfc, XK_Alt_L, TRUE);
-	key(&xfc, XK_Shift_L, TRUE);
-	if (!focus(&xfc, FocusOut, NotifyGrab))
-		goto out;
-	if (!focus(&xfc, FocusOut, NotifyNormal))
-		goto out;
-	key(&xfc, XK_Shift_L, FALSE);
-	key(&xfc, XK_Alt_L, FALSE);
-	if (!focus(&xfc, FocusIn, NotifyNormal))
-		goto out;
-	key(&xfc, XK_Tab, FALSE);
-	CHECK("host Alt+Shift+Tab and unmatched Tab release", "");
-	RESET();
-	key(&xfc, XK_Alt_L, TRUE);
-	if (!focus(&xfc, FocusOut, NotifyNormal))
-		goto out;
-	if (!focus(&xfc, FocusIn, NotifyNormal))
-		goto out;
-	key(&xfc, XK_Alt_L, TRUE);
-	key(&xfc, XK_Alt_L, FALSE);
-	CHECK("return with Alt held, repeat then release", "");
-	RESET();
-	key(&xfc, XK_Alt_L, TRUE);
-	if (!focus(&xfc, FocusOut, NotifyGrab))
-		goto out;
-	if (!focus(&xfc, FocusIn, NotifyUngrab))
-		goto out;
-	key(&xfc, XK_f, TRUE);
-	key(&xfc, XK_f, FALSE);
-	key(&xfc, XK_Alt_L, FALSE);
-	CHECK("return held Alt then guest chord", "A+F+F-A-");
-	RESET();
-	key(&xfc, XK_Alt_L, TRUE);
-	key(&xfc, XK_f, TRUE);
-	if (!focus(&xfc, FocusOut, NotifyWhileGrabbed))
-		goto out;
-	CHECK("cleanup releases only forwarded keys in order", "A+F+F-A-");
-	key(&xfc, XK_f, FALSE);
-	key(&xfc, XK_Alt_L, FALSE);
-	if (!focus(&xfc, FocusIn, NotifyNormal))
-		goto out;
-	CHECK("cleanup does not repeat releases", "A+F+F-A-");
-	RESET();
-	key(&xfc, XK_Alt_L, TRUE);
-	if (!xf_generic_MotionNotify(&xfc, 10, 20, None, FALSE))
-		goto out;
-	CHECK("pointer motion leaves Alt pending", "M-");
-	if (!xf_generic_ButtonEvent(&xfc, 10, 20, 1, None, FALSE, TRUE))
-		goto out;
-	if (!xf_generic_ButtonEvent(&xfc, 10, 20, 1, None, FALSE, FALSE))
-		goto out;
-	key(&xfc, XK_Alt_L, FALSE);
-	CHECK("Alt+button", "M-A+B+B-A-");
-	RESET();
-	key(&xfc, XK_Alt_L, TRUE);
-	if (!xf_generic_ButtonEvent(&xfc, 10, 20, 4, None, FALSE, FALSE))
-		goto out;
-	CHECK("wheel release is not input", "");
-	if (!xf_generic_ButtonEvent(&xfc, 10, 20, 4, None, FALSE, TRUE))
-		goto out;
-	key(&xfc, XK_Alt_L, FALSE);
-	CHECK("Alt+wheel", "A+W+A-");
-	RESET();
-	key(&xfc, XK_Alt_L, TRUE);
-	if (!xf_generic_RawButtonEvent(&xfc, 8, FALSE, TRUE))
-		goto out;
-	key(&xfc, XK_Alt_L, FALSE);
-	CHECK("Alt+raw extended button", "A+E+A-");
-	RESET();
-	key(&xfc, XK_Alt_L, TRUE);
-	key(&xfc, XK_Shift_L, TRUE);
-	key(&xfc, XK_Shift_L, FALSE);
-	key(&xfc, XK_Alt_L, FALSE);
-	CHECK("queued Shift tap preserves order", "A+S+S-A-");
-	RESET();
-	key(&xfc, XK_Alt_L, TRUE);
-	key(&xfc, XK_Shift_L, TRUE);
-	if (!focus(&xfc, FocusOut, NotifyGrab))
-		goto out;
-	if (!focus(&xfc, FocusIn, NotifyUngrab))
-		goto out;
-	CHECK("resync never manufactures modifier taps", "");
-	key(&xfc, XK_f, TRUE);
-	key(&xfc, XK_f, FALSE);
-	key(&xfc, XK_Shift_L, FALSE);
-	key(&xfc, XK_Alt_L, FALSE);
-	CHECK("return with Alt and Shift physically held", "A+S+F+F-S-A-");
-	RESET();
-	key(&xfc, XK_Alt_L, TRUE);
-	xf_keyboard_discard_deferred_alt(&xfc);
-	xfc.deferredAlt.blocked = FALSE; /* Local action without losing focus. */
-	key(&xfc, XK_Alt_L, FALSE);
-	CHECK("local action suppresses unused Alt tap", "");
-	RESET();
-	key(&xfc, XK_Alt_L, TRUE);
-	key(&xfc, XK_f, TRUE);
-	key(&xfc, XK_f, FALSE);
-	xf_keyboard_discard_deferred_alt(&xfc);
-	xfc.deferredAlt.blocked = FALSE;
-	key(&xfc, XK_Alt_L, FALSE);
-	CHECK("local cancellation retains already forwarded Alt release", "A+F+F-A-");
-	RESET();
-	failAlt = TRUE;
-	key(&xfc, XK_Alt_L, TRUE);
-	key(&xfc, XK_Alt_L, FALSE);
-	CHECK("failed Alt-down never produces Alt-up", "");
-	failAlt = FALSE;
+	for (size_t i = 0; i < ARRAYSIZE(cases); i++)
+	{
+		memset(xfc.KeyboardState, 0, sizeof(xfc.KeyboardState));
+		memset(xfc.KeyboardForwarded, 0, sizeof(xfc.KeyboardForwarded));
+		memset(&xfc.deferredAlt, 0, sizeof(xfc.deferredAlt));
+		memset(physical, 0, sizeof(physical));
+		used = 0;
+		trace[0] = '\0';
+		failAlt = (cases[i].flags & FAIL_ALT) != 0;
+		if (!freerdp_settings_set_bool(settings, FreeRDP_KeyboardDeferAlt,
+		                               !(cases[i].flags & DEFAULT_MODE)) ||
+		    !freerdp_settings_set_bool(settings, FreeRDP_UnicodeInput,
+		                               (cases[i].flags & UNICODE_MODE) != 0))
+			goto out;
+		for (size_t j = 0; j < ARRAYSIZE(cases[i].events) && cases[i].events[j] != END; j++)
+		{
+			if (!dispatch(&xfc, cases[i].events[j]))
+			{
+				fprintf(stderr, "%s: event %zu failed\n", cases[i].name, j);
+				goto out;
+			}
+		}
+		if (strcmp(trace, cases[i].expected) != 0)
+		{
+			fprintf(stderr, "%s: expected '%s', got '%s'\n", cases[i].name, cases[i].expected,
+			        trace);
+			goto out;
+		}
+	}
 	rc = 0;
 out:
 	freerdp_settings_free(settings);

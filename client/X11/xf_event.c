@@ -717,14 +717,12 @@ static BOOL xf_event_FocusOut(xfContext* xfc, const XFocusOutEvent* event, BOOL 
 	if (event->mode == NotifyUngrab)
 		return TRUE;
 
-	/* NotifyGrab is significant: a WM can consume Tab without changing focus. */
-	xf_keyboard_discard_deferred_alt(xfc);
-
 	xfc->focused = FALSE;
 
 	if (event->mode == NotifyWhileGrabbed)
 		XUngrabKeyboard(xfc->display, CurrentTime);
 
+	/* NotifyGrab matters even when the WM consumes Tab without changing focus. */
 	xf_keyboard_release_all_keypress(xfc);
 	if (app)
 	{

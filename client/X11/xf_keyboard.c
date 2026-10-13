@@ -871,9 +871,8 @@ static BOOL xf_keyboard_defer_alt_enabled(const xfContext* xfc)
 	return freerdp_settings_get_bool(xfc->common.context.settings, FreeRDP_KeyboardDeferAlt);
 }
 
-static BOOL xf_keyboard_deferred_send(void* context, BOOL down, BOOL repeat, const XKeyEvent* event)
+static BOOL xf_keyboard_forward_key(xfContext* xfc, BOOL down, BOOL repeat, const XKeyEvent* event)
 {
-	xfContext* xfc = context;
 	const DWORD scancode = get_rdp_scancode_from_x11_keycode(xfc, event->keycode);
 	/* Deferred modifiers must remain scancodes even in Unicode mode, including
 	 * the synthetic Alt press after the physical Alt has already been released. */
@@ -882,7 +881,8 @@ static BOOL xf_keyboard_deferred_send(void* context, BOOL down, BOOL repeat, con
 	    (scancode == RDP_SCANCODE_LCONTROL) || (scancode == RDP_SCANCODE_RCONTROL) ||
 	    (scancode == RDP_SCANCODE_LWIN) || (scancode == RDP_SCANCODE_RWIN))
 	{
-		if (!freerdp_input_send_keyboard_event_ex(xfc->common.context.input, down, repeat, scancode))
+		if (!freerdp_input_send_keyboard_event_ex(xfc->common.context.input, down, repeat,
+		                                          scancode))
 			return FALSE;
 	}
 	else
@@ -893,17 +893,40 @@ static BOOL xf_keyboard_deferred_send(void* context, BOOL down, BOOL repeat, con
 	return TRUE;
 }
 
+static BOOL xf_keyboard_forward_keycode(xfContext* xfc, KeyCode code, BOOL down, BOOL repeat)
+{
+	const XKeyEvent event = { .keycode = code };
+	return xf_keyboard_forward_key(xfc, down, repeat, &event);
+}
+
 void xf_keyboard_discard_deferred_alt(xfContext* xfc)
 {
-	if (xf_keyboard_defer_alt_enabled(xfc))
-		xf_deferred_alt_discard(&xfc->deferredAlt);
+	if (!xf_keyboard_defer_alt_enabled(xfc))
+		return;
+	xfc->deferredAlt.canceled = TRUE;
+	xfc->deferredAlt.blocked = TRUE;
+	xfc->deferredAlt.count = 0;
+	/* Forwarded keys remain tracked until cleanup or their release. */
+}
+
+static void xf_keyboard_flush_pending_alt(xfContext* xfc)
+{
+	if (xfc->deferredAlt.blocked || !xfc->deferredAlt.held ||
+	    xfc->KeyboardForwarded[xfc->deferredAlt.alt])
+		return;
+	/* Guest input can use Alt still held after returning from a host shortcut. */
+	if (!xf_keyboard_forward_keycode(xfc, xfc->deferredAlt.alt, TRUE, FALSE))
+		return;
+	for (size_t i = 0; i < xfc->deferredAlt.count; i++)
+		(void)xf_keyboard_forward_keycode(xfc, xfc->deferredAlt.shift[i], TRUE, FALSE);
+	xfc->deferredAlt.count = 0;
 }
 
 static void xf_keyboard_flush_deferred_alt_except(xfContext* xfc, KeyCode skip)
 {
 	if (!xf_keyboard_defer_alt_enabled(xfc) || xfc->deferredAlt.blocked)
 		return;
-	xf_deferred_alt_flush(&xfc->deferredAlt, xf_keyboard_deferred_send, xfc);
+	xf_keyboard_flush_pending_alt(xfc);
 	/* Restore physically held modifiers on the next guest action, never as a tap.
 	 * QueryKeymap on focus-in distinguishes left/right modifiers, unlike modifier masks. */
 	const KeySym modifiers[] = { XK_Shift_L, XK_Shift_R, XK_Control_L, XK_Control_R,
@@ -912,11 +935,7 @@ static void xf_keyboard_flush_deferred_alt_except(xfContext* xfc, KeyCode skip)
 	{
 		const KeyCode code = XKeysymToKeycode(xfc->display, modifiers[i]);
 		if (code && (code != skip) && xfc->KeyboardState[code] && !xfc->KeyboardForwarded[code])
-		{
-			XKeyEvent ev = { 0 };
-			ev.keycode = code;
-			(void)xf_keyboard_deferred_send(xfc, TRUE, FALSE, &ev);
-		}
+			(void)xf_keyboard_forward_keycode(xfc, code, TRUE, FALSE);
 	}
 }
 
@@ -933,8 +952,44 @@ static BOOL xf_keyboard_deferred_key(xfContext* xfc, BOOL down, BOOL repeat, con
 	const BOOL alt = (event->keycode == XKeysymToKeycode(xfc->display, XK_Alt_L)) &&
 	                 (get_rdp_scancode_from_x11_keycode(xfc, event->keycode) == RDP_SCANCODE_LMENU);
 	const BOOL shift = (keysym == XK_Shift_L) || (keysym == XK_Shift_R);
-	return xf_deferred_alt_key(&xfc->deferredAlt, alt, shift, down, repeat, event,
-	                           xf_keyboard_deferred_send, xfc);
+	if (xfc->deferredAlt.blocked)
+		return TRUE;
+	if (alt)
+	{
+		if (down)
+		{
+			if (!xfc->deferredAlt.held)
+			{
+				xfc->deferredAlt.alt = (KeyCode)event->keycode;
+				xfc->deferredAlt.held = TRUE;
+				xfc->deferredAlt.canceled = FALSE;
+			}
+			else if (xfc->KeyboardForwarded[xfc->deferredAlt.alt])
+				(void)xf_keyboard_forward_key(xfc, TRUE, repeat, event);
+		}
+		else
+		{
+			if (xfc->deferredAlt.held && !xfc->deferredAlt.canceled)
+				xf_keyboard_flush_pending_alt(xfc);
+			if (xfc->KeyboardForwarded[xfc->deferredAlt.alt])
+				(void)xf_keyboard_forward_key(xfc, FALSE, FALSE, event);
+			xfc->deferredAlt.held = FALSE;
+			xfc->deferredAlt.count = 0;
+		}
+		return TRUE;
+	}
+	if (shift && down && xfc->deferredAlt.held && !xfc->KeyboardForwarded[xfc->deferredAlt.alt])
+	{
+		for (size_t i = 0; i < xfc->deferredAlt.count; i++)
+		{
+			if (xfc->deferredAlt.shift[i] == event->keycode)
+				return TRUE;
+		}
+		if (xfc->deferredAlt.count < ARRAYSIZE(xfc->deferredAlt.shift))
+			xfc->deferredAlt.shift[xfc->deferredAlt.count++] = (KeyCode)event->keycode;
+		return TRUE;
+	}
+	return FALSE;
 }
 
 void xf_keyboard_key_press(xfContext* xfc, const XKeyEvent* event, KeySym keysym)
@@ -962,7 +1017,7 @@ void xf_keyboard_key_press(xfContext* xfc, const XKeyEvent* event, KeySym keysym
 		if (xf_keyboard_deferred_key(xfc, TRUE, last, event, keysym))
 			return;
 		xf_keyboard_flush_deferred_alt_except(xfc, (KeyCode)event->keycode);
-		(void)xf_keyboard_deferred_send(xfc, TRUE, xfc->KeyboardForwarded[event->keycode], event);
+		(void)xf_keyboard_forward_key(xfc, TRUE, xfc->KeyboardForwarded[event->keycode], event);
 	}
 	else
 		xf_keyboard_send_key(xfc, TRUE, last, event);
@@ -985,14 +1040,14 @@ void xf_keyboard_key_release(xfContext* xfc, const XKeyEvent* event, KeySym keys
 		 * (including a host-consumed Tab) must not flush or synthesize input. */
 		for (size_t i = 0; i < xfc->deferredAlt.count; i++)
 		{
-			if (xfc->deferredAlt.shift[i].keycode == event->keycode)
+			if (xfc->deferredAlt.shift[i] == event->keycode)
 			{
 				xf_keyboard_flush_deferred_alt(xfc);
 				break;
 			}
 		}
 		if (xfc->KeyboardForwarded[event->keycode])
-			(void)xf_keyboard_deferred_send(xfc, FALSE, FALSE, event);
+			(void)xf_keyboard_forward_key(xfc, FALSE, FALSE, event);
 	}
 	else
 		xf_keyboard_send_key(xfc, FALSE, last, event);
@@ -1335,12 +1390,13 @@ void xf_keyboard_focus_in(xfContext* xfc)
 	xk_keyboard_update_modifier_keys(xfc);
 	if (xf_keyboard_defer_alt_enabled(xfc))
 	{
-		XKeyEvent alt = { 0 };
-		alt.keycode = XKeysymToKeycode(xfc->display, XK_Alt_L);
-		const BOOL held =
-		    alt.keycode && xfc->KeyboardState[alt.keycode] &&
-		    (get_rdp_scancode_from_x11_keycode(xfc, alt.keycode) == RDP_SCANCODE_LMENU);
-		xf_deferred_alt_resume(&xfc->deferredAlt, &alt, held);
+		const KeyCode alt = XKeysymToKeycode(xfc->display, XK_Alt_L);
+		xfc->deferredAlt.alt = alt;
+		xfc->deferredAlt.held = alt && xfc->KeyboardState[alt] &&
+		                        (get_rdp_scancode_from_x11_keycode(xfc, alt) == RDP_SCANCODE_LMENU);
+		xfc->deferredAlt.blocked = FALSE;
+		xfc->deferredAlt.canceled = TRUE;
+		xfc->deferredAlt.count = 0;
 	}
 
 	/* finish with a mouse pointer position like mstsc.exe if required */
