@@ -67,6 +67,38 @@ typedef struct
 	BOOL RightSuper;
 } XF_MODIFIER_KEYS;
 
+/* Like UWAC's modifier mask, but preserve individual modifier sides for X11. */
+enum
+{
+	XF_MOD_ALT_L = 0x001,
+	XF_MOD_ALT_R = 0x002,
+	XF_MOD_SHIFT_L = 0x004,
+	XF_MOD_SHIFT_R = 0x008,
+	XF_MOD_CONTROL_L = 0x010,
+	XF_MOD_CONTROL_R = 0x020,
+	XF_MOD_SUPER_L = 0x040,
+	XF_MOD_SUPER_R = 0x080,
+	XF_MOD_LEVEL3 = 0x100,
+	XF_MOD_MODE = 0x200,
+	XF_MOD_ALT = XF_MOD_ALT_L | XF_MOD_ALT_R,
+	XF_MOD_SHIFT = XF_MOD_SHIFT_L | XF_MOD_SHIFT_R
+};
+
+static const struct
+{
+	KeySym keysym;
+	UINT32 mask;
+} xf_modifier_keys[] = { { XK_Alt_L, XF_MOD_ALT_L },
+                         { XK_Alt_R, XF_MOD_ALT_R },
+                         { XK_Shift_L, XF_MOD_SHIFT_L },
+                         { XK_Shift_R, XF_MOD_SHIFT_R },
+                         { XK_Control_L, XF_MOD_CONTROL_L },
+                         { XK_Control_R, XF_MOD_CONTROL_R },
+                         { XK_Super_L, XF_MOD_SUPER_L },
+                         { XK_Super_R, XF_MOD_SUPER_R },
+                         { XK_ISO_Level3_Shift, XF_MOD_LEVEL3 },
+                         { XK_Mode_switch, XF_MOD_MODE } };
+
 struct x11_key_scancode_t
 {
 	const char* name;
@@ -516,7 +548,8 @@ BOOL xf_keyboard_update_modifier_map(xfContext* xfc)
 	return xfc->modifierMap != nullptr;
 }
 
-static void xf_keyboard_send_key(xfContext* xfc, BOOL down, BOOL repeat, const XKeyEvent* ev);
+static BOOL xf_keyboard_send_key(xfContext* xfc, BOOL down, BOOL repeat, const XKeyEvent* ev);
+static DWORD get_rdp_scancode_from_x11_keycode(xfContext* xfc, DWORD keycode);
 
 static BOOL xf_sync_kbd_state(xfContext* xfc)
 {
@@ -865,21 +898,172 @@ void xf_keyboard_free(xfContext* xfc)
 	xf_keyboard_action_script_free(xfc);
 }
 
+static BOOL xf_keyboard_defer_alt_enabled(const xfContext* xfc)
+{
+	return freerdp_settings_get_bool(xfc->common.context.settings, FreeRDP_KeyboardDeferAlt);
+}
+
+static UINT32 xf_keyboard_modifier_mask(xfContext* xfc, KeyCode code)
+{
+	UINT32 mask = 0;
+	if (!code)
+		return 0;
+	for (size_t i = 0; i < ARRAYSIZE(xf_modifier_keys); i++)
+	{
+		if (XKeysymToKeycode(xfc->display, xf_modifier_keys[i].keysym) == code)
+			mask |= xf_modifier_keys[i].mask;
+	}
+	return mask;
+}
+
+static BOOL xf_keyboard_is_deferred_alt(xfContext* xfc, KeyCode code, UINT32 mask)
+{
+	const DWORD scancode = get_rdp_scancode_from_x11_keycode(xfc, code);
+	if (mask & (XF_MOD_LEVEL3 | XF_MOD_MODE))
+		return FALSE;
+	return ((mask & XF_MOD_ALT_L) && (scancode == RDP_SCANCODE_LMENU)) ||
+	       ((mask & XF_MOD_ALT_R) && (scancode == RDP_SCANCODE_RMENU));
+}
+
+static BOOL xf_keyboard_forward_key(xfContext* xfc, BOOL down, BOOL repeat, const XKeyEvent* event)
+{
+	if (!xf_keyboard_send_key(xfc, down, repeat, event))
+		return FALSE;
+	xfc->KeyboardState[event->keycode] = down;
+	return TRUE;
+}
+
+static BOOL xf_keyboard_forward_keycode(xfContext* xfc, KeyCode code, BOOL down)
+{
+	const XKeyEvent event = { .keycode = code };
+	return xf_keyboard_forward_key(xfc, down, FALSE, &event);
+}
+
+static BOOL xf_keyboard_pending_key(const xfContext* xfc, KeyCode code)
+{
+	for (size_t i = 0; i < xfc->deferredAlt.count; i++)
+	{
+		if (xfc->deferredAlt.pending[i] == code)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static void xf_keyboard_remove_pending_key(xfContext* xfc, KeyCode code)
+{
+	for (size_t i = 0; i < xfc->deferredAlt.count; i++)
+	{
+		if (xfc->deferredAlt.pending[i] == code)
+		{
+			memmove(&xfc->deferredAlt.pending[i], &xfc->deferredAlt.pending[i + 1],
+			        (xfc->deferredAlt.count - i - 1) * sizeof(KeyCode));
+			xfc->deferredAlt.count--;
+			break;
+		}
+	}
+}
+
+static void xf_keyboard_queue_modifier(xfContext* xfc, KeyCode code)
+{
+	if (xf_keyboard_pending_key(xfc, code))
+		return;
+	WINPR_ASSERT(xfc->deferredAlt.count < ARRAYSIZE(xfc->deferredAlt.pending));
+	xfc->deferredAlt.pending[xfc->deferredAlt.count++] = code;
+}
+
+void xf_keyboard_discard_deferred_alt(xfContext* xfc)
+{
+	if (!xf_keyboard_defer_alt_enabled(xfc))
+		return;
+	xfc->deferredAlt.canceled |= xfc->deferredAlt.physical & XF_MOD_ALT;
+	xfc->deferredAlt.blocked = TRUE;
+	xfc->deferredAlt.count = 0;
+}
+
+static BOOL xf_keyboard_flush_pending_modifiers(xfContext* xfc)
+{
+	while (xfc->deferredAlt.count > 0)
+	{
+		const KeyCode code = xfc->deferredAlt.pending[0];
+		if (!xfc->KeyboardState[code] && !xf_keyboard_forward_keycode(xfc, code, TRUE))
+			return FALSE;
+		xf_keyboard_remove_pending_key(xfc, code);
+	}
+	return TRUE;
+}
+
+static BOOL xf_keyboard_flush_deferred_alt_except(xfContext* xfc, KeyCode skip)
+{
+	if (!xf_keyboard_defer_alt_enabled(xfc) || xfc->deferredAlt.blocked)
+		return TRUE;
+	if (!xf_keyboard_flush_pending_modifiers(xfc))
+		return FALSE;
+	/* Restore held modifiers only for guest input, never for an unmatched release. */
+	for (size_t i = 0; i < ARRAYSIZE(xf_modifier_keys); i++)
+	{
+		const KeyCode code = XKeysymToKeycode(xfc->display, xf_modifier_keys[i].keysym);
+		if (code && (code != skip) && (xfc->deferredAlt.physical & xf_modifier_keys[i].mask) &&
+		    !xfc->KeyboardState[code])
+		{
+			if (!xf_keyboard_forward_keycode(xfc, code, TRUE))
+				return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+BOOL xf_keyboard_flush_deferred_alt(xfContext* xfc)
+{
+	return xf_keyboard_flush_deferred_alt_except(xfc, 0);
+}
+
 void xf_keyboard_key_press(xfContext* xfc, const XKeyEvent* event, KeySym keysym)
 {
-	BOOL last = 0;
-
 	WINPR_ASSERT(xfc);
 	WINPR_ASSERT(event);
 	WINPR_ASSERT(event->keycode < ARRAYSIZE(xfc->KeyboardState));
 
-	last = xfc->KeyboardState[event->keycode];
-	xfc->KeyboardState[event->keycode] = TRUE;
+	const KeyCode code = (KeyCode)event->keycode;
+	const BOOL defer = xf_keyboard_defer_alt_enabled(xfc);
+	const BOOL last = xfc->KeyboardState[code];
+	const UINT32 mask = defer ? xf_keyboard_modifier_mask(xfc, code) : 0;
+	const BOOL held = (xfc->deferredAlt.physical & mask) != 0;
+	if (defer)
+		xfc->deferredAlt.physical |= mask;
+	else
+		xfc->KeyboardState[code] = TRUE;
 
 	if (xf_keyboard_handle_special_keys(xfc, keysym))
+	{
+		xf_keyboard_discard_deferred_alt(xfc);
+		xfc->deferredAlt.blocked = FALSE;
 		return;
-
-	xf_keyboard_send_key(xfc, TRUE, last, event);
+	}
+	if (!defer)
+	{
+		(void)xf_keyboard_send_key(xfc, TRUE, last, event);
+		return;
+	}
+	if (xfc->deferredAlt.blocked)
+		return;
+	if (xf_keyboard_is_deferred_alt(xfc, code, mask))
+	{
+		if (!held)
+			xfc->deferredAlt.canceled &= ~mask;
+		if (!last)
+		{
+			xf_keyboard_queue_modifier(xfc, code);
+			return;
+		}
+	}
+	else if ((mask & XF_MOD_SHIFT) && !last && xfc->deferredAlt.count)
+	{
+		xf_keyboard_queue_modifier(xfc, code);
+		return;
+	}
+	if (!xf_keyboard_flush_deferred_alt_except(xfc, code))
+		return;
+	(void)xf_keyboard_forward_key(xfc, TRUE, last, event);
 }
 
 void xf_keyboard_key_release(xfContext* xfc, const XKeyEvent* event, KeySym keysym)
@@ -888,10 +1072,34 @@ void xf_keyboard_key_release(xfContext* xfc, const XKeyEvent* event, KeySym keys
 	WINPR_ASSERT(event);
 	WINPR_ASSERT(event->keycode < ARRAYSIZE(xfc->KeyboardState));
 
-	BOOL last = xfc->KeyboardState[event->keycode];
-	xfc->KeyboardState[event->keycode] = FALSE;
+	const KeyCode code = (KeyCode)event->keycode;
+	const BOOL defer = xf_keyboard_defer_alt_enabled(xfc);
+	const BOOL last = xfc->KeyboardState[code];
+	const UINT32 mask = defer ? xf_keyboard_modifier_mask(xfc, code) : 0;
+	if (defer)
+		xfc->deferredAlt.physical &= ~mask;
+	else
+		xfc->KeyboardState[code] = FALSE;
 	xf_keyboard_handle_special_keys_release(xfc, keysym);
-	xf_keyboard_send_key(xfc, FALSE, last, event);
+	if (!defer)
+	{
+		(void)xf_keyboard_send_key(xfc, FALSE, last, event);
+		return;
+	}
+	if (xfc->deferredAlt.blocked)
+		return;
+	if (xf_keyboard_pending_key(xfc, code))
+	{
+		/* A canceled Alt release is not a guest action, even if another Alt is pending. */
+		if (xf_keyboard_is_deferred_alt(xfc, code, mask) && (xfc->deferredAlt.canceled & mask))
+			xf_keyboard_remove_pending_key(xfc, code);
+		else
+			(void)xf_keyboard_flush_pending_modifiers(xfc);
+	}
+	if (xfc->KeyboardState[code])
+		(void)xf_keyboard_forward_key(xfc, FALSE, FALSE, event);
+	xf_keyboard_remove_pending_key(xfc, code);
+	xfc->deferredAlt.canceled &= ~mask;
 }
 
 static DWORD get_rdp_scancode_from_x11_keycode(xfContext* xfc, DWORD keycode)
@@ -975,6 +1183,7 @@ void xf_keyboard_release_all_keypress(xfContext* xfc)
 {
 	WINPR_ASSERT(xfc);
 
+	xf_keyboard_discard_deferred_alt(xfc);
 	release_keys(xfc, FALSE);
 	release_keys(xfc, TRUE);
 }
@@ -983,6 +1192,12 @@ static BOOL xf_keyboard_key_pressed(xfContext* xfc, KeySym keysym)
 {
 	KeyCode keycode = XKeysymToKeycode(xfc->display, keysym);
 	WINPR_ASSERT(keycode < ARRAYSIZE(xfc->KeyboardState));
+	if (xf_keyboard_defer_alt_enabled(xfc))
+	{
+		const UINT32 mask = xf_keyboard_modifier_mask(xfc, keycode);
+		if (mask)
+			return (xfc->deferredAlt.physical & mask) != 0;
+	}
 	return xfc->KeyboardState[keycode];
 }
 
@@ -998,7 +1213,7 @@ static BOOL xf_keyboard_has_system_modifier(xfContext* xfc)
 	return mod.Ctrl || mod.Alt || mod.Super;
 }
 
-void xf_keyboard_send_key(xfContext* xfc, BOOL down, BOOL repeat, const XKeyEvent* event)
+static BOOL xf_keyboard_send_key(xfContext* xfc, BOOL down, BOOL repeat, const XKeyEvent* event)
 {
 	WINPR_ASSERT(xfc);
 	WINPR_ASSERT(event);
@@ -1007,6 +1222,13 @@ void xf_keyboard_send_key(xfContext* xfc, BOOL down, BOOL repeat, const XKeyEven
 	WINPR_ASSERT(input);
 
 	const DWORD rdp_scancode = get_rdp_scancode_from_x11_keycode(xfc, event->keycode);
+	/* Synthetic modifiers remain scancodes even after physical release in Unicode mode. */
+	if (xf_keyboard_defer_alt_enabled(xfc) &&
+	    ((rdp_scancode == RDP_SCANCODE_LMENU) || (rdp_scancode == RDP_SCANCODE_RMENU) ||
+	     (rdp_scancode == RDP_SCANCODE_LSHIFT) || (rdp_scancode == RDP_SCANCODE_RSHIFT) ||
+	     (rdp_scancode == RDP_SCANCODE_LCONTROL) || (rdp_scancode == RDP_SCANCODE_RCONTROL) ||
+	     (rdp_scancode == RDP_SCANCODE_LWIN) || (rdp_scancode == RDP_SCANCODE_RWIN)))
+		return freerdp_input_send_keyboard_event_ex(input, down, repeat, rdp_scancode);
 	if (rdp_scancode == RDP_SCANCODE_PAUSE && !xf_keyboard_key_pressed(xfc, XK_Control_L) &&
 	    !xf_keyboard_key_pressed(xfc, XK_Control_R))
 	{
@@ -1016,7 +1238,7 @@ void xf_keyboard_send_key(xfContext* xfc, BOOL down, BOOL repeat, const XKeyEven
 		 */
 		if (down)
 		{
-			freerdp_input_send_keyboard_pause_event(input);
+			return freerdp_input_send_keyboard_pause_event(input);
 		}
 	}
 	else
@@ -1067,7 +1289,7 @@ void xf_keyboard_send_key(xfContext* xfc, BOOL down, BOOL repeat, const XKeyEven
 				if (rdp_scancode == RDP_SCANCODE_UNKNOWN)
 					WLog_ERR(TAG, "Unknown key with X keycode 0x%02" PRIx8 "", event->keycode);
 				else
-					freerdp_input_send_keyboard_event_ex(input, down, repeat, rdp_scancode);
+					return freerdp_input_send_keyboard_event_ex(input, down, repeat, rdp_scancode);
 			}
 			else
 			{
@@ -1077,15 +1299,16 @@ void xf_keyboard_send_key(xfContext* xfc, BOOL down, BOOL repeat, const XKeyEven
 
 				WCHAR wbuffer[ARRAYSIZE(buffer)] = WINPR_C_ARRAY_INIT;
 				(void)ConvertUtf8ToWChar(str, wbuffer, rc);
-				freerdp_input_send_unicode_keyboard_event(input, down ? 0 : KBD_FLAGS_RELEASE,
+				return freerdp_input_send_unicode_keyboard_event(input, down ? 0 : KBD_FLAGS_RELEASE,
 				                                          wbuffer[0]);
 			}
 		}
 		else if (rdp_scancode == RDP_SCANCODE_UNKNOWN)
 			WLog_ERR(TAG, "Unknown key with X keycode 0x%02" PRIx8 "", event->keycode);
 		else
-			freerdp_input_send_keyboard_event_ex(input, down, repeat, rdp_scancode);
+			return freerdp_input_send_keyboard_event_ex(input, down, repeat, rdp_scancode);
 	}
+	return FALSE;
 }
 
 static int xf_keyboard_read_keyboard_state(xfContext* xfc)
@@ -1186,6 +1409,22 @@ static void xk_keyboard_update_modifier_keys(xfContext* xfc)
 		                       XK_Control_L, XK_Control_R, XK_Super_L, XK_Super_R };
 
 	xf_keyboard_clear(xfc);
+	if (xf_keyboard_defer_alt_enabled(xfc))
+	{
+		char physical[32] = WINPR_C_ARRAY_INIT;
+		XQueryKeymap(xfc->display, physical);
+		xfc->deferredAlt.physical = 0;
+		for (size_t i = 0; i < ARRAYSIZE(xf_modifier_keys); i++)
+		{
+			const KeyCode code = XKeysymToKeycode(xfc->display, xf_modifier_keys[i].keysym);
+			if (code && (physical[code / 8] & (1 << (code % 8))))
+				xfc->deferredAlt.physical |= xf_modifier_keys[i].mask;
+		}
+		xfc->deferredAlt.canceled = xfc->deferredAlt.physical & XF_MOD_ALT;
+		xfc->deferredAlt.blocked = FALSE;
+		xfc->deferredAlt.count = 0;
+		return;
+	}
 
 	const int state = xf_keyboard_read_keyboard_state(xfc);
 
@@ -1578,6 +1817,8 @@ BOOL xf_keyboard_set_ime_status(rdpContext* context, UINT16 imeId, UINT32 imeSta
 BOOL xf_ungrab(xfContext* xfc)
 {
 	WINPR_ASSERT(xfc);
+	if (xf_keyboard_defer_alt_enabled(xfc))
+		xf_keyboard_release_all_keypress(xfc);
 	XUngrabKeyboard(xfc->display, CurrentTime);
 	XUngrabPointer(xfc->display, CurrentTime);
 	xfc->common.mouse_grabbed = FALSE;

@@ -203,7 +203,17 @@ struct xf_context
 	BOOL focused;
 	BOOL mouse_active;
 	BOOL fullscreen_toggle;
+	/* Physical keys by default; forwarded keys when KeyboardDeferAlt is enabled. */
 	BOOL KeyboardState[256];
+	struct
+	{
+		UINT32 physical;
+		UINT32 canceled;
+		BOOL blocked;
+		/* Both Alt and both Shift keys, in physical press order. */
+		KeyCode pending[4];
+		size_t count;
+	} deferredAlt;
 	XModifierKeymap* modifierMap;
 	wArrayList* keyCombinations;
 	wArrayList* xevents;
