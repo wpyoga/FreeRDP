@@ -1299,8 +1299,8 @@ static BOOL xf_keyboard_send_key(xfContext* xfc, BOOL down, BOOL repeat, const X
 
 				WCHAR wbuffer[ARRAYSIZE(buffer)] = WINPR_C_ARRAY_INIT;
 				(void)ConvertUtf8ToWChar(str, wbuffer, rc);
-				return freerdp_input_send_unicode_keyboard_event(input, down ? 0 : KBD_FLAGS_RELEASE,
-				                                          wbuffer[0]);
+				return freerdp_input_send_unicode_keyboard_event(
+				    input, down ? 0 : KBD_FLAGS_RELEASE, wbuffer[0]);
 			}
 		}
 		else if (rdp_scancode == RDP_SCANCODE_UNKNOWN)
