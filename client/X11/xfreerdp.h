@@ -25,6 +25,7 @@
 #include <freerdp/config.h>
 
 #include "xf_types.h"
+#include "xf_keyboard_deferred.h"
 #include "xf_disp.h"
 #include "xf_cliprdr.h"
 #include "xf_video.h"
@@ -203,7 +204,9 @@ struct xf_context
 	BOOL focused;
 	BOOL mouse_active;
 	BOOL fullscreen_toggle;
-	BOOL KeyboardState[256];
+	BOOL KeyboardState[256];     /* Physical state, including locally consumed keys. */
+	BOOL KeyboardForwarded[256]; /* Used only with KeyboardDeferAlt enabled. */
+	xfDeferredAlt deferredAlt;
 	XModifierKeymap* modifierMap;
 	wArrayList* keyCombinations;
 	wArrayList* xevents;

@@ -69,6 +69,8 @@ set(SRCS
     xf_disp.h
     xf_graphics.c
     xf_graphics.h
+    xf_keyboard_deferred.c
+    xf_keyboard_deferred.h
     xf_keyboard.c
     xf_keyboard.h
     keyboard_x11.h
